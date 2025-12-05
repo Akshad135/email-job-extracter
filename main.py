@@ -17,10 +17,16 @@ EMAIL_PASS = os.getenv("EMAIL_PASS")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 EMAIL_SUBJECT_QUERY = "god bless you"
-DAYS_BACK_TO_SEARCH = 45
+DAYS_BACK_TO_SEARCH = 30
 
-PRIMARY_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODEL = "qwen/qwen3-32b"
+MODEL_LIST = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "groq/compound",
+    "qwen/qwen3-32b",
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant"
+]
 TEMPERATURE = 0.1
 MAX_CONTEXT_CHARS = 10000
 
@@ -50,8 +56,9 @@ CHECKPOINT_FILE = "processed_email_ids.txt"
 NORMAL_SLEEP_INTERVAL = 10
 RATE_LIMIT_SLEEP = 60
 MAX_RETRIES = 3
+RECONNECT_INTERVAL = 20
 
-current_model = PRIMARY_MODEL
+current_model_index = 0
 
 def load_processed_ids():
     if not os.path.exists(CHECKPOINT_FILE):
@@ -91,10 +98,27 @@ def get_email_body(msg):
         return msg.get_payload(decode=True).decode(errors='ignore')
     return ""
 
+def connect_imap():
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(EMAIL_USER, EMAIL_PASS)
+        mail.select("inbox")
+        return mail
+    except Exception as e:
+        print(f"[ERROR] Connection failed: {e}")
+        return None
+
+def close_imap(mail):
+    try:
+        mail.logout()
+    except:
+        pass
+
 def call_groq_with_retry(client, prompt):
-    global current_model
+    global current_model_index
     
     for attempt in range(MAX_RETRIES):
+        current_model = MODEL_LIST[current_model_index]
         try:
             response = client.chat.completions.create(
                 model=current_model,
@@ -107,13 +131,15 @@ def call_groq_with_retry(client, prompt):
             )
             return json.loads(response.choices[0].message.content).get("jobs", [])
         except RateLimitError:
-            if current_model == PRIMARY_MODEL:
-                print(f"[INFO] Switching to fallback model: {FALLBACK_MODEL}")
-                current_model = FALLBACK_MODEL
+            if current_model_index < len(MODEL_LIST) - 1:
+                current_model_index += 1
+                next_model = MODEL_LIST[current_model_index]
+                print(f"[INFO] Rate limit on {current_model.split('/')[-1]}. Switching to: {next_model.split('/')[-1]}")
                 continue
             else:
-                print(f"[WARNING] Rate limit on fallback. Sleeping {RATE_LIMIT_SLEEP}s...")
+                print(f"[WARNING] All models exhausted. Sleeping {RATE_LIMIT_SLEEP}s...")
                 time.sleep(RATE_LIMIT_SLEEP)
+                current_model_index = 0
                 continue
         except Exception as e:
             print(f"[ERROR] API call failed (attempt {attempt+1}): {e}")
@@ -126,50 +152,60 @@ def extract_jobs(client, email_body):
     truncated_body = email_body[:MAX_CONTEXT_CHARS]
     
     prompt = f"""ONLY Extract technical jobs matching these domains:
-            {json.dumps(TARGET_DOMAINS)}
+{json.dumps(TARGET_DOMAINS)}
 
-            STRICTLY REJECT roles containing: {json.dumps(FORBIDDEN_KEYWORDS)}
+STRICTLY REJECT roles containing: {json.dumps(FORBIDDEN_KEYWORDS)}
 
-            RULES:
-            - Salary >= {MIN_SALARY_LPA} LPA: Extract if domain matches
-            - Salary < {MIN_SALARY_LPA} LPA: Reject
-            - No salary: Extract only if clear tech role from recognised company
-            - Spam/marketing emails: Return empty
+RULES:
+- Salary >= {MIN_SALARY_LPA} LPA: Extract if domain matches
+- Salary < {MIN_SALARY_LPA} LPA: Reject
+- No salary: Extract only if clear tech role from recognised company
+- Spam/marketing emails: Return empty
 
-            OUTPUT (JSON):
-            {{
-            "jobs": [
-                {{
-                "role": "exact job title",
-                "company": "company name",
-                "salary": "X-Y LPA or Not Specified",
-                "experience": "X-Y years or Not Specified",
-                "location": "city",
-                "match_reason": "which TARGET_DOMAIN matches",
-                "apply_link": "URL or Not Specified"
-                }}
-            ]
-            }}
+OUTPUT (JSON):
+{{
+  "jobs": [
+    {{
+      "role": "exact job title",
+      "company": "company name",
+      "salary": "X-Y LPA or Not Specified",
+      "experience": "X-Y years or Not Specified",
+      "location": "city",
+      "match_reason": "which TARGET_DOMAIN matches",
+      "apply_link": "URL or Not Specified"
+    }}
+  ]
+}}
 
-            Return {{"jobs": []}} if no valid technical jobs found.
+Return {{"jobs": []}} if no valid technical jobs found.
 
-            EMAIL:
-            {truncated_body}"""
+EMAIL:
+{truncated_body}"""
     
     return call_groq_with_retry(client, prompt)
 
+def fetch_email_with_retry(mail, e_id):
+    for attempt in range(3):
+        try:
+            _, msg_data = mail.fetch(e_id, "(RFC822)")
+            return email.message_from_bytes(msg_data[0][1])
+        except Exception as e:
+            if attempt < 2:
+                print(f"[WARN] Fetch failed (attempt {attempt+1}), retrying...")
+                time.sleep(2)
+            else:
+                raise e
+
 def main():
+    global current_model_index
+    
     if not EMAIL_USER or not GROQ_API_KEY:
         print("[ERROR] Missing credentials in .env file.")
         return
     
     print("[INFO] Connecting to Gmail IMAP...")
-    try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(EMAIL_USER, EMAIL_PASS)
-        mail.select("inbox")
-    except Exception as e:
-        print(f"[ERROR] Connection failed: {e}")
+    mail = connect_imap()
+    if not mail:
         return
     
     since_date = get_cutoff_date(DAYS_BACK_TO_SEARCH)
@@ -179,6 +215,7 @@ def main():
     
     if not messages[0]:
         print("[INFO] No emails found matching criteria.")
+        close_imap(mail)
         return
     
     email_ids = messages[0].split()
@@ -186,20 +223,31 @@ def main():
     todo_ids = [eid for eid in email_ids if eid.decode() not in processed_ids]
     
     print(f"[INFO] Total: {len(email_ids)} | Processed: {len(processed_ids)} | Remaining: {len(todo_ids)}")
-    print(f"[INFO] Using primary model: {PRIMARY_MODEL}")
+    print(f"[INFO] Available models: {', '.join([m.split('/')[-1] for m in MODEL_LIST])}")
+    print(f"[INFO] Starting with: {MODEL_LIST[0].split('/')[-1]}")
     
     client = Groq(api_key=GROQ_API_KEY)
     
     for i, e_id in enumerate(todo_ids):
         e_id_str = e_id.decode()
+        
+        if i > 0 and i % RECONNECT_INTERVAL == 0:
+            print(f"[INFO] Reconnecting to IMAP (processed {i} emails)...")
+            close_imap(mail)
+            time.sleep(2)
+            mail = connect_imap()
+            if not mail:
+                print("[ERROR] Reconnection failed. Stopping.")
+                return
+        
         try:
-            _, msg_data = mail.fetch(e_id, "(RFC822)")
-            msg = email.message_from_bytes(msg_data[0][1])
+            msg = fetch_email_with_retry(mail, e_id)
             subject = decode_header(msg["Subject"])[0][0]
             if isinstance(subject, bytes): 
                 subject = subject.decode()
             date = msg["Date"]
             
+            current_model = MODEL_LIST[current_model_index]
             print(f"[INFO] [{i+1}/{len(todo_ids)}] {subject[:40]}... (Model: {current_model.split('/')[-1]})")
             
             body = get_email_body(msg)
@@ -221,10 +269,11 @@ def main():
             
         except Exception as e:
             print(f"[ERROR] Failed on {e_id_str}: {e}")
+            mark_as_processed(e_id_str)
             continue
     
     print("[INFO] Processing complete.")
-    mail.logout()
+    close_imap(mail)
 
 if __name__ == "__main__":
     main()
